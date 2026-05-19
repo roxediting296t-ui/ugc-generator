@@ -1,1 +1,22 @@
+# UGC Video Ad Generator — requirements.txt
+# pip install -r requirements.txt
 
+gradio>=4.0.0
+edge-tts>=6.1.10
+Pillow>=10.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+moviepy>=1.0.3
+requests>=2.31.0
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+
+# PyTorch — install manually based on your GPU:
+# GPU (CUDA 12.1): pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# CPU only:        pip install torch torchvision torchaudio
+
+# Optional — Real-ESRGAN upscaling:
+# pip install realesrgan basicsr facexlib gfpgan
+
+# Optional — ElevenLabs SDK:
+# pip install elevenlabs
