@@ -1,16 +1,4 @@
-"""
-main.py — UGC Video Ad Generator (Production-Grade)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Run: python main.py
-UI:  http://localhost:7860
-
-Setup:
-  1. pip install -r requirements.txt
-  2. Set LIVE_PORTRAIT_DIR env var → path to cloned LivePortrait repo
-  3. (Optional) Set ELEVENLABS_API_KEY for premium voice quality
-  4. (Optional) Set REALESRGAN_WEIGHTS for 4K-quality upscaling
-"""
+%%writefile /content/ugc-generator/main.py
 
 import logging
 import os
@@ -24,504 +12,387 @@ from pathlib import Path
 import gradio as gr
 from dotenv import load_dotenv
 
-from pipeline import (
-    ALL_VOICES, ASPECT_RATIOS, COLOR_GRADES, GRAIN_LEVELS, CAPTION_STYLES,
-    generate_audio, get_audio_duration,
-    merge_images, validate_and_preprocess_face,
-    animate_video,
-    post_process, upscale_with_realesrgan,
-    generate_caption_filter, generate_hook_overlay,
-)
-
-# ── Load .env file ────────────────────────────────────────────────────────────
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ugc")
 
-# ── Config ────────────────────────────────────────────────────────────────────
 LIVE_PORTRAIT_DIR = Path(
-    os.environ.get("LIVE_PORTRAIT_DIR", "./LivePortrait")
-).resolve()
-
+    os.environ.get("LIVE_PORTRAIT_DIR", "./LivePortrait")).resolve()
 REALESRGAN_WEIGHTS = os.environ.get(
-    "REALESRGAN_WEIGHTS", "./weights/RealESRGAN_x4plus.pth"
-)
-
+    "REALESRGAN_WEIGHTS", "./weights/RealESRGAN_x4plus.pth")
 OUTPUT_DIR = Path("./outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+ASPECT_RATIOS = {
+    "9:16 Portrait (TikTok/Reels)": (1080, 1920),
+    "1:1 Square (Instagram Feed)":  (1080, 1080),
+    "16:9 Landscape (YouTube)":     (1920, 1080),
+}
+COLOR_GRADES = {
+    "warm":      "eq=brightness=0.03:contrast=1.10:saturation=1.15",
+    "cool":      "eq=brightness=0.02:contrast=1.08:saturation=1.10",
+    "neutral":   "eq=brightness=0.01:contrast=1.05:saturation=1.05",
+    "cinematic": "eq=brightness=-0.02:contrast=1.15:saturation=0.90",
+    "vibrant":   "eq=brightness=0.04:contrast=1.12:saturation=1.35",
+}
+TTS_VOICES = {
+    "Aria (Female, US)":      "en-US-AriaNeural",
+    "Jenny (Female, US)":     "en-US-JennyNeural",
+    "Christopher (Male, US)": "en-US-ChristopherNeural",
+    "Eric (Male, US)":        "en-US-EricNeural",
+    "Guy (Male, US)":         "en-US-GuyNeural",
+    "Sonia (Female, UK)":     "en-GB-SoniaNeural",
+}
 
-# ── Pipeline orchestrator ─────────────────────────────────────────────────────
 
 def run_pipeline(
-    # Inputs
-    human_image,
-    product_image,
-    script,
-    # Voice
-    voice_key,
-    speech_rate,
-    speech_pitch,
-    elevenlabs_key,
-    el_stability,
-    el_similarity,
-    # Image
-    placement,
-    product_scale,
-    enable_bg_blur,
-    bg_blur_strength,
-    # Animation
-    motion_scale,
-    enable_eye,
-    enable_lip,
-    # Layout & grade
-    aspect_ratio,
-    color_grade,
-    grain_level,
-    enable_vignette,
-    enable_shake,
-    shake_intensity,
-    # Captions
-    caption_style,
-    hook_text,
-    # Audio
-    bgm_file,
-    bgm_volume,
-    voice_volume,
-    # Fade
-    fade_in,
-    fade_out,
-    # Quality
-    enable_upscale,
+    human_image, product_image, script,
+    voice_key, speech_rate,
+    placement, product_scale,
+    aspect_ratio, color_grade,
+    enable_vignette, enable_shake,
+    caption_style, hook_text,
+    bgm_volume, voice_volume,
+    fade_in, fade_out,
 ):
-    # ── Input validation ─────────────────────────────────────────────────────
+    # ── Validation ────────────────────────────────────────────────────
     if human_image is None:
-        return None, "❌ Upload a base human image."
+        return None, "❌ Upload a human image."
     if product_image is None:
-        return None, "❌ Upload a product image (PNG)."
+        return None, "❌ Upload a product image."
     if not script.strip():
-        return None, "❌ Enter an ad script."
-
-    # Override ElevenLabs key from UI if provided
-    if elevenlabs_key and elevenlabs_key.strip():
-        os.environ["ELEVENLABS_API_KEY"] = elevenlabs_key.strip()
+        return None, "❌ Enter a script."
 
     job_id = str(uuid.uuid4())[:8]
     job_dir = OUTPUT_DIR / f"job_{job_id}"
     job_dir.mkdir(parents=True, exist_ok=True)
-
-    log.info(f"\n{'═'*60}\n  JOB {job_id}\n{'═'*60}")
     status = []
     t0 = time.time()
 
     try:
-        # ── Phase 2: Voice ───────────────────────────────────────────────────
-        yield None, "⏳ Generating voice..."
-        audio_path = generate_audio(
-            script, voice_key, job_dir,
-            rate=speech_rate, pitch=speech_pitch,
-            stability=float(el_stability),
-            similarity_boost=float(el_similarity),
-        )
-        duration = get_audio_duration(audio_path)
-        status.append(f"✅ Voice generated ({duration:.1f}s)")
-        yield None, "\n".join(status)
+        # ── Phase 2: TTS ──────────────────────────────────────────────
+        import asyncio, edge_tts
+        voice_id = TTS_VOICES.get(voice_key, "en-US-AriaNeural")
+        audio_path = job_dir / "voiceover.mp3"
 
-        # ── Phase 3a: Image merge ─────────────────────────────────────────────
-        yield None, "\n".join(status) + "\n⏳ Placing product on image..."
-        merged = merge_images(
-            human_image, product_image, job_dir,
-            placement=placement,
-            product_scale=float(product_scale),
-            enable_bg_blur=enable_bg_blur,
-            bg_blur_strength=int(bg_blur_strength),
-        )
+        async def do_tts():
+            comm = edge_tts.Communicate(
+                text=script, voice=voice_id, rate=speech_rate)
+            await comm.save(str(audio_path))
+
+        asyncio.run(do_tts())
+
+        if not audio_path.exists() or audio_path.stat().st_size < 500:
+            return None, "❌ TTS failed — check internet connection."
+
+        status.append("✅ Voice generated")
+
+        # ── Get audio duration ────────────────────────────────────────
+        import json
+        r = subprocess.run(
+            ["ffprobe","-v","quiet","-print_format","json",
+             "-show_format", str(audio_path)],
+            capture_output=True, text=True)
+        duration = float(json.loads(r.stdout)["format"]["duration"])
+
+        # ── Phase 3: Image merge ──────────────────────────────────────
+        from PIL import Image, ImageFilter
+        import numpy as np
+
+        base = Image.open(human_image).convert("RGBA")
+        product = Image.open(product_image).convert("RGBA")
+        base_w, base_h = base.size
+        new_w = int(base_w * float(product_scale))
+        ratio = new_w / product.width
+        new_h = int(product.height * ratio)
+        product = product.resize((new_w, new_h), Image.LANCZOS)
+        margin = int(base_w * 0.05)
+        prod_w, prod_h = product.size
+
+        pos_map = {
+            "bottom_right": (base_w-prod_w-margin, base_h-prod_h-margin),
+            "bottom_left":  (margin, base_h-prod_h-margin),
+            "top_right":    (base_w-prod_w-margin, margin),
+            "top_left":     (margin, margin),
+            "center":       (base_w//2-prod_w//2, base_h//2-prod_h//2),
+            "hand":         (base_w//2-prod_w//2, int(base_h*0.62)),
+        }
+        px, py = pos_map.get(placement, pos_map["bottom_right"])
+        layer = Image.new("RGBA", base.size, (0,0,0,0))
+        layer.paste(product, (px, py), product)
+        merged = Image.alpha_composite(base, layer)
+        merged_path = job_dir / "merged.png"
+        merged.convert("RGB").save(str(merged_path))
         status.append("✅ Product placed on image")
-        yield None, "\n".join(status)
 
-        # ── Phase 3b: Face preprocessing ──────────────────────────────────────
-        yield None, "\n".join(status) + "\n⏳ Detecting face..."
-        face = validate_and_preprocess_face(merged, job_dir)
-        status.append("✅ Face detected and preprocessed")
-        yield None, "\n".join(status)
+        # ── Phase 3b: Face detect ─────────────────────────────────────
+        import cv2
+        img_cv = cv2.imread(str(merged_path))
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        gray = cv2.equalizeHist(gray)
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        faces = cascade.detectMultiScale(gray, 1.05, 4, minSize=(60,60))
 
-        # ── Phase 4: Animation ───────────────────────────────────────────────
-        yield None, "\n".join(status) + "\n⏳ Animating face (this takes 30–120s on GPU)..."
-        animated = animate_video(
-            face, audio_path, job_dir,
-            live_portrait_dir=LIVE_PORTRAIT_DIR,
-            motion_scale=float(motion_scale),
-            enable_eye_retargeting=enable_eye,
-            enable_lip_retargeting=enable_lip,
-        )
-        status.append("✅ Face animated with lip-sync")
-        yield None, "\n".join(status)
+        if len(faces) == 0:
+            return None, "❌ No face detected. Use a clear front-facing photo."
 
-        # ── Phase 4b: Optional upscale ────────────────────────────────────────
-        if enable_upscale:
-            yield None, "\n".join(status) + "\n⏳ Upscaling frames with Real-ESRGAN..."
-            animated = upscale_with_realesrgan(animated, job_dir, REALESRGAN_WEIGHTS)
-            status.append("✅ Frames upscaled (Real-ESRGAN)")
-            yield None, "\n".join(status)
+        x,y,w,h = max(faces, key=lambda f: f[2]*f[3])
+        pad = int(max(w,h)*0.45)
+        ih,iw = img_cv.shape[:2]
+        x1,y1 = max(0,x-pad), max(0,y-pad)
+        x2,y2 = min(iw,x+w+pad), min(ih,y+h+pad)
+        crop = img_cv[y1:y2, x1:x2]
+        sz = max(crop.shape[:2])
+        sq = np.zeros((sz,sz,3), dtype=np.uint8)
+        yo = (sz-crop.shape[0])//2
+        xo = (sz-crop.shape[1])//2
+        sq[yo:yo+crop.shape[0], xo:xo+crop.shape[1]] = crop
+        face_img = cv2.resize(sq, (512,512), interpolation=cv2.INTER_LANCZOS4)
+        face_path = job_dir / "face.png"
+        cv2.imwrite(str(face_path), face_img)
+        status.append("✅ Face detected")
 
-        # ── Phase 5: Captions ────────────────────────────────────────────────
-        caption_filter = ""
-        hook_filter = ""
-        if caption_style != "none":
-            caption_filter = generate_caption_filter(script, duration, style=caption_style)
-            status.append(f"✅ Captions generated ({caption_style} style)")
+        # ── Phase 4: LivePortrait ─────────────────────────────────────
+        lp_script = LIVE_PORTRAIT_DIR / "inference.py"
+        if not lp_script.exists():
+            return None, f"❌ LivePortrait not found: {LIVE_PORTRAIT_DIR}"
+
+        cmd = [
+            sys.executable, str(lp_script),
+            "--source_image", str(face_path),
+            "--audio", str(audio_path),
+            "--output_dir", str(job_dir),
+            "--output_name", "animated",
+            "--flag_relative", "--flag_pasteback", "--flag_do_crop",
+        ]
+        result = subprocess.run(
+            cmd, cwd=str(LIVE_PORTRAIT_DIR),
+            capture_output=True, text=True, timeout=600)
+
+        if result.returncode != 0:
+            return None, f"❌ LivePortrait failed:\n{result.stderr[-1500:]}"
+
+        anim_path = job_dir / "animated.mp4"
+        if not anim_path.exists():
+            candidates = list(job_dir.glob("*.mp4"))
+            if not candidates:
+                return None, "❌ LivePortrait produced no video output."
+            anim_path = candidates[0]
+        status.append("✅ Face animated")
+
+        # ── Phase 5: FFmpeg post-process ──────────────────────────────
+        tw, th = ASPECT_RATIOS.get(aspect_ratio, (1080,1920))
+        grade = COLOR_GRADES.get(color_grade, COLOR_GRADES["warm"])
+
+        vf_parts = [
+            f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+            f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1",
+            grade,
+            "noise=alls=12:allf=t+u",
+        ]
+        if enable_vignette:
+            vf_parts.append("vignette=angle=PI/4")
+        if enable_shake:
+            vf_parts.append(
+                f"crop=w={tw}:h={th}:"
+                f"x='{tw}*0.01*sin(t*2.1)':"
+                f"y='{th}*0.008*sin(t*1.7)',"
+                f"scale={tw}:{th}"
+            )
+        if fade_in > 0:
+            vf_parts.append(f"fade=t=in:st=0:d={fade_in}")
+        if fade_out > 0:
+            fo_start = max(0, duration - fade_out)
+            vf_parts.append(f"fade=t=out:st={fo_start:.2f}:d={fade_out}")
+
+        # Captions
+        if caption_style != "none" and script.strip():
+            words = script.replace("'","\u2019").split()
+            seg_size = 3
+            segs = [" ".join(words[i:i+seg_size])
+                    for i in range(0,len(words),seg_size)]
+            total_w = sum(len(s) for s in segs)
+            t_cur = 0.1
+            cap_filters = []
+            for seg in segs:
+                seg_dur = max(0.5, min(3.5, (len(seg)/total_w)*(duration-0.2)))
+                safe = seg.replace(":","\:").replace("%","\%")
+                cap_filters.append(
+                    f"drawtext=text='{safe}':fontsize=72:fontcolor=white:"
+                    f"bordercolor=black:borderw=4:x=(w-text_w)/2:y=h-h/6:"
+                    f"enable='between(t,{t_cur:.2f},{t_cur+seg_dur:.2f})'"
+                )
+                t_cur += seg_dur
+            vf_parts.extend(cap_filters)
+
+        # Hook text
         if hook_text.strip():
-            hook_filter = generate_hook_overlay(hook_text, duration=2.5, style="ugc")
-            status.append("✅ Hook text overlay added")
+            import re
+            safe_hook = re.sub(r'[^\x00-\x7F]','', hook_text).strip()
+            safe_hook = safe_hook.replace(":","\:").replace("%","\%")
+            if safe_hook:
+                vf_parts.append(
+                    f"drawtext=text='{safe_hook}':fontsize=80:"
+                    f"fontcolor=white:bordercolor=black:borderw=5:"
+                    f"x=(w-text_w)/2:y=h/4:"
+                    f"enable='between(t,0,2.5)'"
+                )
 
-        # ── Phase 5: Post-process ─────────────────────────────────────────────
-        yield None, "\n".join(status) + "\n⏳ Rendering final video..."
-        bgm_path = bgm_file if bgm_file else None
-        final_output = OUTPUT_DIR / f"ugc_ad_{job_id}.mp4"
+        vf_string = ",".join(vf_parts)
+        final_path = OUTPUT_DIR / f"ugc_ad_{job_id}.mp4"
 
-        final = post_process(
-            animated_video=animated,
-            audio_path=audio_path,
-            job_dir=job_dir,
-            output_path=final_output,
-            aspect_ratio=aspect_ratio,
-            color_grade=color_grade,
-            grain_level=grain_level,
-            enable_vignette=enable_vignette,
-            enable_camera_shake=enable_shake,
-            shake_intensity=float(shake_intensity),
-            fade_in_duration=float(fade_in),
-            fade_out_duration=float(fade_out),
-            caption_filter=caption_filter,
-            hook_filter=hook_filter,
-            bgm_path=bgm_path,
-            bgm_volume=float(bgm_volume),
-            voice_volume=float(voice_volume),
-        )
+        ff_cmd = [
+            "ffmpeg", "-y",
+            "-i", str(anim_path),
+            "-i", str(audio_path),
+            "-map","0:v:0","-map","1:a:0",
+            "-vf", vf_string,
+            "-c:v","libx264","-crf","16","-preset","fast",
+            "-pix_fmt","yuv420p",
+            "-c:a","aac","-b:a","192k","-ar","48000",
+            "-shortest","-movflags","+faststart",
+            str(final_path),
+        ]
 
-        elapsed = time.time() - t0
-        status.append(f"✅ Final video rendered")
-        status.append(f"\n🎬 Done in {elapsed:.0f}s → {final.name}")
-        yield str(final), "\n".join(status)
+        ff = subprocess.run(ff_cmd, capture_output=True, text=True, timeout=300)
+        if ff.returncode != 0:
+            return None, f"❌ FFmpeg failed:\n{ff.stderr[-1500:]}"
 
-    except (ValueError, FileNotFoundError, RuntimeError) as e:
-        log.error(f"Pipeline error: {e}")
-        yield None, "\n".join(status) + f"\n\n❌ {type(e).__name__}:\n{e}"
+        elapsed = time.time()-t0
+        status.append(f"✅ Video rendered")
+        status.append(f"\n🎬 Done in {elapsed:.0f}s!")
+        return str(final_path), "\n".join(status)
 
     except Exception as e:
-        log.exception("Unexpected error")
-        yield None, "\n".join(status) + f"\n\n❌ Unexpected: {type(e).__name__}: {e}"
+        log.exception("Pipeline error")
+        return None, f"❌ Error: {type(e).__name__}: {e}"
 
-
-# ── UI ────────────────────────────────────────────────────────────────────────
 
 def build_ui():
-    css = """
-    footer { display: none !important; }
-    .section-title { font-weight: 700; font-size: 15px; margin-top: 8px; color: #f97316; }
-    .status-log { font-family: 'Courier New', monospace !important; font-size: 12px; }
-    """
-
     with gr.Blocks(
         title="UGC Ad Generator",
-        theme=gr.themes.Default(
-            primary_hue="orange",
-            secondary_hue="slate",
-            neutral_hue="slate",
-        ),
-        css=css,
+        theme=gr.themes.Default(primary_hue="orange"),
     ) as demo:
+        gr.Markdown("# 🎬 UGC Video Ad Generator\n**Realistic • Lip-synced • Cinematic**")
 
-        gr.Markdown("""
-        # 🎬 UGC Video Ad Generator
-        **Realistic • Lip-synced • Cinematic** — Upload face + product + script → ready-to-post UGC ad
-        """)
-
-        with gr.Row(equal_height=False):
-
-            # ════════════════════════════════════════════
-            # LEFT COLUMN — All Controls
-            # ════════════════════════════════════════════
-            with gr.Column(scale=1, min_width=400):
-
-                # ── Inputs ───────────────────────────────
+        with gr.Row():
+            with gr.Column(scale=1):
                 gr.Markdown("### 📥 Inputs")
                 human_image = gr.Image(
-                    label="Base Human Image (front-facing, well-lit)",
-                    type="filepath", height=220,
-                )
+                    label="Human Image (front-facing)",
+                    type="filepath", height=220)
                 product_image = gr.Image(
-                    label="Product Image (PNG with transparent background)",
-                    type="filepath", height=180,
-                )
+                    label="Product Image (PNG)",
+                    type="filepath", height=180)
                 script_input = gr.Textbox(
-                    label="Ad Script",
-                    placeholder="e.g. I've been using this for 30 days and my skin has completely transformed. No harsh chemicals, no irritation — just real results. Link in bio.",
-                    lines=4, max_lines=8,
-                )
+                    label="Ad Script", lines=4,
+                    placeholder="e.g. This product changed my life in 30 days...")
 
-                # ── Voice Settings ────────────────────────
-                with gr.Accordion("🎙️ Voice Settings", open=True):
+                with gr.Accordion("🎙️ Voice", open=True):
                     with gr.Row():
                         voice_select = gr.Dropdown(
                             label="Voice",
-                            choices=list(ALL_VOICES.keys()),
-                            value="Aria (Female, US)",
-                        )
+                            choices=list(TTS_VOICES.keys()),
+                            value="Aria (Female, US)")
                         speech_rate = gr.Dropdown(
                             label="Speed",
-                            choices=["-20%", "-10%", "+0%", "+10%", "+20%"],
-                            value="+0%",
-                        )
-                    speech_pitch = gr.Dropdown(
-                        label="Pitch (edge-tts only)",
-                        choices=["-10Hz", "+0Hz", "+10Hz", "+20Hz"],
-                        value="+0Hz",
-                    )
-                    gr.Markdown("**ElevenLabs (optional — better quality)**")
-                    elevenlabs_key = gr.Textbox(
-                        label="ElevenLabs API Key",
-                        placeholder="sk-... (leave empty to use free edge-tts)",
-                        type="password",
-                    )
-                    with gr.Row():
-                        el_stability = gr.Slider(
-                            label="Stability", minimum=0.0, maximum=1.0,
-                            step=0.05, value=0.50,
-                        )
-                        el_similarity = gr.Slider(
-                            label="Similarity Boost", minimum=0.0, maximum=1.0,
-                            step=0.05, value=0.75,
-                        )
+                            choices=["-20%","-10%","+0%","+10%","+20%"],
+                            value="+0%")
 
-                # ── Product Placement ─────────────────────
-                with gr.Accordion("📦 Product Placement", open=True):
+                with gr.Accordion("📦 Product", open=True):
                     with gr.Row():
                         placement = gr.Dropdown(
                             label="Position",
-                            choices=["bottom_right", "bottom_left", "top_right",
-                                     "top_left", "center", "hand"],
-                            value="bottom_right",
-                        )
+                            choices=["bottom_right","bottom_left",
+                                     "top_right","top_left","center","hand"],
+                            value="bottom_right")
                         product_scale = gr.Slider(
-                            label="Size (% of frame width)",
-                            minimum=0.10, maximum=0.55, step=0.05, value=0.28,
-                        )
-                    enable_bg_blur = gr.Checkbox(
-                        label="Portrait Mode Blur (background blur)",
-                        value=False,
-                    )
-                    bg_blur_strength = gr.Slider(
-                        label="Blur Strength", minimum=2, maximum=20,
-                        step=1, value=8, visible=False,
-                    )
-                    enable_bg_blur.change(
-                        fn=lambda x: gr.update(visible=x),
-                        inputs=enable_bg_blur,
-                        outputs=bg_blur_strength,
-                    )
+                            label="Size", minimum=0.10,
+                            maximum=0.55, step=0.05, value=0.28)
 
-                # ── Animation ─────────────────────────────
-                with gr.Accordion("🎭 Animation (LivePortrait)", open=False):
-                    motion_scale = gr.Slider(
-                        label="Head Movement Intensity",
-                        minimum=0.3, maximum=2.0, step=0.1, value=1.0,
-                    )
-                    with gr.Row():
-                        enable_eye = gr.Checkbox(label="Eye Blink Retargeting", value=True)
-                        enable_lip = gr.Checkbox(label="Lip Sync Retargeting", value=True)
-
-                # ── Visual Effects ────────────────────────
                 with gr.Accordion("🎨 Visual Effects", open=True):
                     with gr.Row():
                         aspect_ratio = gr.Dropdown(
                             label="Aspect Ratio",
                             choices=list(ASPECT_RATIOS.keys()),
-                            value="9:16 Portrait (TikTok/Reels)",
-                        )
+                            value="9:16 Portrait (TikTok/Reels)")
                         color_grade = gr.Dropdown(
                             label="Color Grade",
                             choices=list(COLOR_GRADES.keys()),
-                            value="warm",
-                        )
+                            value="warm")
                     with gr.Row():
-                        grain_level = gr.Dropdown(
-                            label="Film Grain (phone-shot look)",
-                            choices=list(GRAIN_LEVELS.keys()),
-                            value="subtle",
-                        )
-                    with gr.Row():
-                        enable_vignette = gr.Checkbox(label="Vignette", value=True)
-                        enable_shake = gr.Checkbox(label="Handheld Shake", value=True)
-                    shake_intensity = gr.Slider(
-                        label="Shake Intensity",
-                        minimum=0.2, maximum=3.0, step=0.1, value=1.0,
-                    )
+                        enable_vignette = gr.Checkbox(
+                            label="Vignette", value=True)
+                        enable_shake = gr.Checkbox(
+                            label="Handheld Shake", value=True)
                     with gr.Row():
                         fade_in = gr.Slider(
-                            label="Fade In (sec)", minimum=0, maximum=1.5,
-                            step=0.1, value=0.4,
-                        )
+                            label="Fade In (sec)",
+                            minimum=0, maximum=1.5, step=0.1, value=0.4)
                         fade_out = gr.Slider(
-                            label="Fade Out (sec)", minimum=0, maximum=1.5,
-                            step=0.1, value=0.5,
-                        )
+                            label="Fade Out (sec)",
+                            minimum=0, maximum=1.5, step=0.1, value=0.5)
 
-                # ── Captions ─────────────────────────────
-                with gr.Accordion("💬 Captions & Hook Text", open=True):
+                with gr.Accordion("💬 Captions", open=True):
                     caption_style = gr.Dropdown(
                         label="Caption Style",
-                        choices=list(CAPTION_STYLES.keys()),
-                        value="ugc",
-                    )
+                        choices=["ugc","subtitle","none"],
+                        value="ugc")
                     hook_text = gr.Textbox(
-                        label="Hook Text (shown first 2.5 seconds)",
-                        placeholder="e.g. Wait... this actually works?",
-                        lines=1,
-                    )
+                        label="Hook Text (first 2.5 seconds)",
+                        placeholder="Wait... this actually works?",
+                        lines=1)
 
-                # ── Background Music ──────────────────────
-                with gr.Accordion("🎵 Background Music", open=False):
-                    bgm_file = gr.File(
-                        label="BGM Audio File (mp3/wav — optional)",
-                        file_types=["audio"],
-                    )
+                with gr.Accordion("🎵 Audio Mix", open=False):
                     with gr.Row():
                         bgm_volume = gr.Slider(
-                            label="BGM Volume", minimum=0.0, maximum=0.5,
-                            step=0.01, value=0.12,
-                        )
+                            label="BGM Volume",
+                            minimum=0.0, maximum=0.5,
+                            step=0.01, value=0.12)
                         voice_volume = gr.Slider(
-                            label="Voice Volume", minimum=0.5, maximum=2.0,
-                            step=0.05, value=1.0,
-                        )
-
-                # ── Quality ───────────────────────────────
-                with gr.Accordion("⚡ Quality", open=False):
-                    enable_upscale = gr.Checkbox(
-                        label="Real-ESRGAN Upscaling (sharper faces — needs GPU + weights)",
-                        value=False,
-                    )
+                            label="Voice Volume",
+                            minimum=0.5, maximum=2.0,
+                            step=0.05, value=1.0)
 
                 generate_btn = gr.Button(
                     "🎬 Generate UGC Ad",
-                    variant="primary",
-                    size="lg",
-                )
+                    variant="primary", size="lg")
 
-            # ════════════════════════════════════════════
-            # RIGHT COLUMN — Output
-            # ════════════════════════════════════════════
-            with gr.Column(scale=1, min_width=400):
+            with gr.Column(scale=1):
                 gr.Markdown("### 📤 Output")
-
                 output_video = gr.Video(
-                    label="Generated UGC Video Ad",
-                    height=520,
-                )
+                    label="Generated UGC Video", height=500)
                 status_box = gr.Textbox(
-                    label="Pipeline Status",
-                    lines=12,
-                    interactive=False,
-                    elem_classes=["status-log"],
-                    placeholder=(
-                        "Pipeline status will appear here...\n\n"
-                        "Typical times (with GPU):\n"
-                        "  Voice:      2–5s\n"
-                        "  Image:      1–2s\n"
-                        "  Animation:  30–90s\n"
-                        "  Render:     10–20s"
-                    ),
-                )
-
-                gr.Markdown("""
-                ---
-                **Tips for best results:**
-                - Use a front-facing, well-lit photo (AI-generated works great)
-                - Product PNG must have transparent background
-                - Keep script under 45 seconds for best lip-sync quality
-                - "Warm" color grade + "subtle" grain = most realistic phone-shot look
-                """)
-
-        # ── Event binding ─────────────────────────────────────────────────────
-        all_inputs = [
-            human_image, product_image, script_input,
-            voice_select, speech_rate, speech_pitch,
-            elevenlabs_key, el_stability, el_similarity,
-            placement, product_scale, enable_bg_blur, bg_blur_strength,
-            motion_scale, enable_eye, enable_lip,
-            aspect_ratio, color_grade, grain_level,
-            enable_vignette, enable_shake, shake_intensity,
-            caption_style, hook_text,
-            bgm_file, bgm_volume, voice_volume,
-            fade_in, fade_out,
-            enable_upscale,
-        ]
+                    label="Status", lines=10, interactive=False,
+                    placeholder="Status appears here after generation...")
 
         generate_btn.click(
             fn=run_pipeline,
-            inputs=all_inputs,
+            inputs=[
+                human_image, product_image, script_input,
+                voice_select, speech_rate,
+                placement, product_scale,
+                aspect_ratio, color_grade,
+                enable_vignette, enable_shake,
+                caption_style, hook_text,
+                bgm_volume, voice_volume,
+                fade_in, fade_out,
+            ],
             outputs=[output_video, status_box],
-            show_progress="full",
             queue=True,
         )
-
     return demo
 
 
-# ── Environment check ─────────────────────────────────────────────────────────
-
-def check_environment():
-    log.info("[ENV] Pre-flight checks...")
-    ok = True
-
-    if shutil.which("ffmpeg") is None:
-        log.warning("⚠️  FFmpeg not found — install: sudo apt install ffmpeg")
-        ok = False
-    else:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True)
-        log.info(f"✅ FFmpeg: {r.stdout.split(chr(10))[0]}")
-
-    if not LIVE_PORTRAIT_DIR.exists():
-        log.warning(f"⚠️  LivePortrait not found: {LIVE_PORTRAIT_DIR}")
-        log.warning("   Fix: git clone https://github.com/KwaiVGI/LivePortrait.git")
-        log.warning(f"   Then: export LIVE_PORTRAIT_DIR={LIVE_PORTRAIT_DIR}")
-    else:
-        log.info(f"✅ LivePortrait: {LIVE_PORTRAIT_DIR}")
-
-    if os.environ.get("ELEVENLABS_API_KEY"):
-        log.info("✅ ElevenLabs API key found")
-    else:
-        log.info("ℹ️  No ElevenLabs key — using edge-tts (free)")
-
-    try:
-        import torch
-        if torch.cuda.is_available():
-            log.info(f"✅ GPU: {torch.cuda.get_device_name(0)}")
-        else:
-            log.warning("⚠️  No CUDA GPU — LivePortrait will be slow on CPU")
-    except ImportError:
-        log.warning("⚠️  PyTorch not installed")
-
-    log.info("[ENV] Done.\n")
-    return ok
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
-    check_environment()
     demo = build_ui()
-    demo.queue(max_size=3)
+    demo.queue()
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
-        share=False,       # set True for public gradio.live URL (Colab)
-        inbrowser=True,
+        share=True,
         show_error=True,
     )
